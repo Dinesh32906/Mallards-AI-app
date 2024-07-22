@@ -1,0 +1,13 @@
+credentials:
+  usernames:
+    dinesh1985:
+      email: dinesh1985@gmail.com
+      name: Dinesh
+      password: '$2b$12$LX1OlRY64GUr/Pw0R3cMZ.cSw7eeRZuvKW51HRIu2nuawWiOLSIOe'
+cookie:
+  expiry_days: 30
+  key: random_signature_key # Must be a string
+  name: random_cookie_name
+preauthorized:
+  emails:
+    - dinesh1985@gmail.com

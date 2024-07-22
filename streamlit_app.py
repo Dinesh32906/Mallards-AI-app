@@ -1,15 +1,16 @@
 import streamlit as st
-import snowflake.connector
+from snowflake.connector import connect
 import pandas as pd
 from config import *
 
-# Define the number of chunks to be used in context
+# Default values
 num_chunks = 3
+slide_window = 7
 
 def get_snowflake_connection():
     try:
         st.write("Attempting to connect to Snowflake...")
-        conn = snowflake.connector.connect(
+        conn = connect(
             user=SNOWFLAKE_USER,
             password=SNOWFLAKE_PASSWORD,
             account=SNOWFLAKE_ACCOUNT,
@@ -18,116 +19,191 @@ def get_snowflake_connection():
             database=SNOWFLAKE_DATABASE,
             schema=SNOWFLAKE_SCHEMA
         )
-        st.success("Connected to Snowflake")
+        st.write("Connected to Snowflake")
         return conn
     except Exception as e:
         st.error(f"Error connecting to Snowflake: {e}")
         return None
 
-def create_prompt(myquestion, rag):
-    if rag == 1:
-        cmd = f"""
-         WITH results AS (
-           SELECT RELATIVE_PATH,
-             VECTOR_COSINE_SIMILARITY(docs_chunks_table.chunk_vec,
-                      SNOWFLAKE.CORTEX.EMBED_TEXT_768('e5-base-v2', '{myquestion.replace("'", "''")}')) AS similarity,
-             chunk
-           FROM docs_chunks_table
-           ORDER BY similarity DESC
-           LIMIT {num_chunks}
-         )
-         SELECT chunk, relative_path FROM results
-         """
-    
-        cur = conn.cursor()
-        cur.execute(cmd)
-        df_context = pd.DataFrame(cur.fetchall(), columns=[desc[0] for desc in cur.description])
-        
-        context_length = len(df_context)
-        prompt_context = ""
-        for i in range(context_length):
-            prompt_context += df_context.at[i, 'CHUNK']
-        
-        prompt_context = prompt_context.replace("'", "")
-        relative_path = df_context.at[0, 'RELATIVE_PATH']
-        
-        prompt = f"""
-        'You are an expert assistant extracting information from context provided. 
-         Answer the question based on the context. Be concise and do not hallucinate. 
-         If you don’t have the information, just say so.
-        Context: {prompt_context}
-        Question: {myquestion}
-        Answer:'
-        """
-        
-        cmd2 = f"SELECT GET_PRESIGNED_URL(@docs, '{relative_path}', 360) AS URL_LINK FROM directory(@docs)"
-        cur.execute(cmd2)
-        df_url_link = pd.DataFrame(cur.fetchall(), columns=[desc[0] for desc in cur.description])
-        url_link = df_url_link.at[0, 'URL_LINK']
-    
-    else:
-        prompt = f"""
-        'Question: {myquestion}
-        Answer:'
-        """
-        url_link = "None"
-        relative_path = "None"
-        
-    return prompt, url_link, relative_path
+def init_session_state():
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+    if "model_name" not in st.session_state:
+        st.session_state.model_name = 'mixtral-8x7b'
+    if "use_chat_history" not in st.session_state:
+        st.session_state.use_chat_history = True
+    if "debug" not in st.session_state:
+        st.session_state.debug = False
 
-def complete(myquestion, model_name, rag=1):
-    prompt, url_link, relative_path = create_prompt(myquestion, rag)
-    cmd = f"""
-        SELECT SNOWFLAKE.CORTEX.COMPLETE('{model_name}', {prompt}) AS response
+def config_options():
+    st.sidebar.selectbox('Select your model:', (
+        'mixtral-8x7b',
+        'snowflake-arctic',
+        'mistral-large',
+        'llama3-8b',
+        'llama3-70b',
+        'reka-flash',
+        'mistral-7b',
+        'llama2-70b-chat',
+        'gemma-7b'), key="model_name")
+    
+    st.sidebar.checkbox('Do you want that I remember the chat history?', key="use_chat_history", value=True)
+    st.sidebar.checkbox('Debug: Click to see summary generated of previous conversation', key="debug", value=False)
+    st.sidebar.button("Start Over", key="clear_conversation")
+
+def init_messages():
+    if st.session_state.clear_conversation:
+        st.session_state.messages = []
+
+def get_similar_chunks(question, session):
+    cmd = """
+        WITH results AS (
+            SELECT RELATIVE_PATH,
+                   VECTOR_COSINE_SIMILARITY(docs_chunks_table.chunk_vec,
+                                            SNOWFLAKE.CORTEX.EMBED_TEXT_768('e5-base-v2', %s)) AS similarity,
+                   chunk
+            FROM docs_chunks_table
+            ORDER BY similarity DESC
+            LIMIT %s)
+        SELECT chunk, relative_path FROM results
     """
+    cur = session.cursor()
+    cur.execute(cmd, (question, num_chunks))
+    rows = cur.fetchall()
+    cur.close()
     
-    cur = conn.cursor()
-    cur.execute(cmd)
-    df_response = pd.DataFrame(cur.fetchall(), columns=[desc[0] for desc in cur.description])
-    return df_response, url_link, relative_path
+    df_chunks = pd.DataFrame(rows, columns=['chunk', 'relative_path'])
+    
+    df_chunks_length = len(df_chunks) - 1
 
-def display_response(question, model, rag=0):
-    response, url_link, relative_path = complete(question, model, rag)
-    res_text = response.at[0, 'RESPONSE']
-    st.markdown(res_text)
-    if rag == 1:
-        display_url = f"Link to [{relative_path}]({url_link}) that may be useful"
-        st.markdown(display_url)
+    similar_chunks = ""
+    for i in range(df_chunks_length):
+        similar_chunks += df_chunks.iloc[i]['chunk']
+    similar_chunks = similar_chunks.replace("'", "")
+    
+    return similar_chunks
 
-# Main code
-st.title("Snowflake Cortex Document Assistant")
-st.write("""You can ask questions and decide if you want to use your documents for context or allow the model to create their own response.""")
-st.write("This is the list of documents you already have:")
+def get_chat_history():
+    chat_history = []
+    start_index = max(0, len(st.session_state.messages) - slide_window)
+    for i in range(start_index, len(st.session_state.messages) - 1):
+        chat_history.append(st.session_state.messages[i])
+    return chat_history
 
-conn = get_snowflake_connection()
-if conn:
-    st.write("Connection established.")
-    cur = conn.cursor()
-    cur.execute("ls @docs")
-    docs_available = cur.fetchall()
-    list_docs = [doc[0] for doc in docs_available]
-    st.dataframe(list_docs)
+def summarize_question_with_history(chat_history, question, session):
+    prompt = f"""
+        Based on the chat history below and the question, generate a query that extends the question
+        with the chat history provided. The query should be in natural language. 
+        Answer with only the query. Do not add any explanation.
+        
+        <chat_history>
+        {chat_history}
+        </chat_history>
+        <question>
+        {question}
+        </question>
+        """
+    
+    cmd = """
+        SELECT snowflake.cortex.complete(%s, %s) AS response
+    """
+    cur = session.cursor()
+    cur.execute(cmd, (st.session_state.model_name, prompt))
+    rows = cur.fetchall()
+    cur.close()
+    
+    summary = rows[0][0]
 
-    # Here you can choose what LLM to use. Please note that they will have different cost & performance
-    model = st.sidebar.selectbox('Select your model:', (
-                                    'mixtral-8x7b',
-                                    'snowflake-arctic',
-                                    'mistral-large',
-                                    'llama3-8b',
-                                    'llama3-70b',
-                                    'reka-flash',
-                                     'mistral-7b',
-                                     'llama2-70b-chat',
-                                     'gemma-7b'))
+    if st.session_state.debug:
+        st.sidebar.text("Summary to be used to find similar chunks in the docs:")
+        st.sidebar.caption(summary)
 
-    question = st.text_input("Enter question", placeholder="Ask anything about event...", label_visibility="collapsed")
+    summary = summary.replace("'", "")
+    return summary
 
-    rag = st.sidebar.checkbox('Use your own documents as context?')
-
-    if st.button('Submit'):
-        if question:
-            display_response(question, model, rag)
+def create_prompt(myquestion, session):
+    if st.session_state.use_chat_history:
+        chat_history = get_chat_history()
+        if chat_history:
+            question_summary = summarize_question_with_history(chat_history, myquestion, session)
+            prompt_context = get_similar_chunks(question_summary, session)
         else:
-            st.warning("Please enter a question.")
-else:
-    st.error("Failed to connect to Snowflake.")
+            prompt_context = get_similar_chunks(myquestion, session)
+    else:
+        prompt_context = get_similar_chunks(myquestion, session)
+        chat_history = ""
+
+    prompt = f"""
+        You are an expert chat assistant that extracts information from the CONTEXT provided
+        between <context> and </context> tags.
+        You offer a chat experience considering the information included in the CHAT HISTORY
+        provided between <chat_history> and </chat_history> tags.
+        When answering the question contained between <question> and </question> tags
+        be concise and do not hallucinate. 
+        If you don’t have the information just say so.
+        
+        Do not mention the CONTEXT used in your answer.
+        Do not mention the CHAT HISTORY used in your answer.
+        
+        <chat_history>
+        {chat_history}
+        </chat_history>
+        <context>
+        {prompt_context}
+        </context>
+        <question>
+        {myquestion}
+        </question>
+        Answer:
+        """
+    return prompt
+
+def complete(myquestion, session):
+    prompt = create_prompt(myquestion, session)
+    cmd = """
+        SELECT snowflake.cortex.complete(%s, %s) AS response
+    """
+    cur = session.cursor()
+    cur.execute(cmd, (st.session_state.model_name, prompt))
+    rows = cur.fetchall()
+    cur.close()
+    
+    return rows[0][0]
+
+def main():
+    init_session_state()
+    st.title(":speech_balloon: Chat Document Assistant with Snowflake Cortex")
+    st.write("This is the list of documents you already have and that will be used to answer your questions:")
+    
+    conn = get_snowflake_connection()
+    if conn:
+        session = conn
+        docs_available = session.cursor().execute("ls @docs").fetchall()
+        list_docs = [doc[0] for doc in docs_available]
+        st.dataframe(list_docs)
+        config_options()
+        init_messages()
+
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+
+        if question := st.chat_input("What do you want to know about your products?"):
+            st.session_state.messages.append({"role": "user", "content": question})
+            with st.chat_message("user"):
+                st.markdown(question)
+            with st.chat_message("assistant"):
+                message_placeholder = st.empty()
+                question = question.replace("'", "")
+                with st.spinner(f"{st.session_state.model_name} thinking..."):
+                    response = complete(question, session)
+                    res_text = response
+                    res_text = res_text.replace("'", "")
+                    message_placeholder.markdown(res_text)
+            st.session_state.messages.append({"role": "assistant", "content": res_text})
+        session.close()
+    else:
+        st.error("Failed to connect to Snowflake.")
+
+if __name__ == "__main__":
+    main()
